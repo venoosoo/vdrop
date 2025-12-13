@@ -6,7 +6,7 @@ use tokio::time::{timeout, Duration};
 use tokio::task;
 use tokio::sync::Mutex;
 use tokio::process::Command;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use serde::Serialize;
 use hostname::get;
 use futures::StreamExt;
@@ -17,8 +17,22 @@ use std::path::PathBuf;
 use std::env;
 use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence};
 use base64::engine::general_purpose;
+use tokio::net::UdpSocket;
+use serde::{Deserialize};
+use uuid::Uuid;
+use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tauri::Manager;
 
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DiscoveryMsg {
+    app: String,
+    device_name: String,
+    port: u16,
+    instance_id: String,
+}
 
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,7 +42,8 @@ struct Pc {
 }
 
 struct AppState {
-    devices: Mutex<Vec<Pc>>,
+    devices: Mutex<HashMap<IpAddr, (Pc, Instant)>>,
+    instance_id: String,
 }
 
 const PORT: u16 = 5005;
@@ -70,100 +85,60 @@ async fn send_file(ip: String, file_path: String, file_name: String) -> Result<S
     Ok(format!("Successfully sent {} bytes", amount_sent))
 }
 
+
+
+
+async fn broadcast_presence(msg: DiscoveryMsg) {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    socket.set_broadcast(true).unwrap();
+    let data = serde_json::to_vec(&msg).unwrap();
+
+    println!("[DEBUG][BROADCAST] Sending presence every 3s");
+
+    loop {
+        if let Err(e) = socket.send_to(&data, "255.255.255.255:5005").await {
+            println!("[DEBUG][BROADCAST] Failed to send: {}", e);
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+
+async fn listen_for_devices(state: Arc<AppState>) {
+    let socket = UdpSocket::bind("0.0.0.0:5005").await.unwrap();
+    let mut buf = [0u8; 1024];
+    println!("[DEBUG][LISTENER] UDP listener started on 0.0.0.0:5005");
+
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, addr)) => {
+                if let Ok(msg) = serde_json::from_slice::<DiscoveryMsg>(&buf[..len]) {
+                    if msg.app == "vdrop" && msg.instance_id != state.instance_id {
+                        let mut devices = state.devices.lock().await;
+                        devices.insert(
+                            addr.ip(),
+                            (Pc { ip: addr.ip(), name: msg.device_name.clone() }, std::time::Instant::now())
+                        );
+                        println!("[DEBUG][LISTENER] Found device: {} ({})", msg.device_name, addr.ip());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[DEBUG][LISTENER] UDP recv error: {}", e);
+            }
+        }
+    }
+}
+
 // --- SCAN NETWORK COMMAND ---
 #[tauri::command]
 async fn scan_network(state: State<'_, AppState>) -> Result<Vec<Pc>, String> {
-    println!("[SCAN] Starting network scan...");
-    let scanned = internal_scan_logic().await.map_err(|e| e.to_string())?;
-    println!("[SCAN] Initial scan found {} devices", scanned.len());
-    
-    let timeout_duration = Duration::from_millis(200);
-
-    let mut tasks = futures::stream::FuturesUnordered::new();
-
-    for pc in scanned {
-        let pc_clone = pc.clone();
-        tasks.push(task::spawn(async move {
-            let addr = SocketAddr::new(pc_clone.ip, PORT);
-            if timeout(timeout_duration, TcpStream::connect(addr))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .is_some()
-            {
-                println!("[SCAN] {} has our app running!", pc_clone.ip);
-                Some(pc_clone)
-            } else {
-                println!("[SCAN] {} doesn't have our app", pc_clone.ip);
-                None
-            }
-        }));
-    }
-
-    let mut final_list = Vec::new();
-    while let Some(result) = tasks.next().await {
-        if let Ok(Some(pc)) = result {
-            final_list.push(pc);
-        }
-    }
-
-    println!("[SCAN] Final list: {} devices with our app", final_list.len());
-    for pc in &final_list {
-        println!("[SCAN] Device: {} ({})", pc.name, pc.ip);
-    }
-
-    let mut guard = state.devices.lock().await;
-    *guard = final_list.clone();
-
-    Ok(final_list)
+    let devices = state.devices.lock().await;
+    Ok(devices.values().map(|(pc, _)| pc.clone()).collect())
 }
 
-// --- INTERNAL NETWORK SCAN ---
-async fn internal_scan_logic() -> Result<Vec<Pc>, Box<dyn std::error::Error>> {
-    let local_ip_addr = local_ip()?;
-    println!("[SCAN] Local IP detected: {}", local_ip_addr);
-    
-    let (subnet_a, subnet_b, subnet_c) = match local_ip_addr {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            (octets[0], octets[1], octets[2])
-        }
-        _ => (192, 168, 1),
-    };
 
-    println!("[SCAN] Scanning subnet: {}.{}.{}.0/24", subnet_a, subnet_b, subnet_c);
-    
-    let self_name = get()?.to_string_lossy().to_string();
-    println!("[SCAN] Local hostname: {}", self_name);
-    
-    let mut tasks = futures::stream::FuturesUnordered::new();
-
-    for i in 1..=254 {
-        let ip = IpAddr::V4(Ipv4Addr::new(subnet_a, subnet_b, subnet_c, i));
-        // for deleting ourselves from users lists
-        //let self_name_clone = self_name.clone();
-        tasks.push(task::spawn(async move {
-            let alive = is_alive(&ip).await;
-            if alive {
-                println!("[SCAN] Found alive host: {}", ip);
-                let name = get_hostname(&ip).await;
-                println!("[SCAN] Hostname resolved: {} -> {}", ip, name);
-                return Ok::<Option<Pc>, Box<dyn std::error::Error + Send + Sync>>(Some(Pc { ip, name }));
-            }
-            Ok(None)
-        }));
-    }
-
-    let mut pcs = Vec::new();
-    while let Some(result) = tasks.next().await {
-        if let Ok(Ok(Some(pc))) = result {
-            pcs.push(pc);
-        }
-    }
-
-    println!("[SCAN] Scan complete. Found {} devices", pcs.len());
-    Ok(pcs)
-}
 
 
 pub async fn is_alive(ip: &IpAddr) -> bool {
@@ -183,51 +158,6 @@ pub async fn is_alive(ip: &IpAddr) -> bool {
     }
 }
 
-async fn get_hostname(ip: &IpAddr) -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = timeout(
-            Duration::from_secs(1),
-            Command::new("nslookup").arg(ip.to_string()).output()
-        )
-        .await
-        {
-            if let Ok(output) = output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(name) = stdout
-                    .lines()
-                    .find(|l| l.contains("Name:"))
-                    .and_then(|l| l.split_whitespace().last())
-                {
-                    return name.to_string();
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = timeout(
-            Duration::from_secs(1),
-            Command::new("host").arg(ip.to_string()).output()
-        )
-        .await
-        {
-            if let Ok(output) = output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().next() {
-                    if line.contains("domain name pointer") {
-                        if let Some(name) = line.split("pointer").nth(1) {
-                            return name.trim().trim_end_matches('.').to_string();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    format!("Device-{}", ip)
-}
 
 // --- START SERVER TO RECEIVE FILES ---
 pub async fn start_receiving() {
@@ -352,21 +282,66 @@ fn get_received() -> Result<Vec<ReceivedFile>, String> {
     Ok(files_vec)
 }
 
+
+async fn cleanup_devices(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let mut devices = state.devices.lock().await;
+        let before = devices.len();
+        devices.retain(|_, (_, last_seen)| last_seen.elapsed() < Duration::from_secs(15));
+        let after = devices.len();
+
+        println!("[DEBUG][CLEANUP] Devices before: {}, after: {}", before, after);
+    }
+}
 // --- RUN APP ---
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let instance_id = Uuid::new_v4().to_string();
+    let device_name = get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let state = Arc::new(AppState {
+        devices: Mutex::new(HashMap::new()),
+        instance_id: instance_id.clone(),
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            devices: Mutex::new(Vec::new()),
-        })
-        .setup(|_app| {
-            tauri::async_runtime::spawn(async move {
-                start_receiving().await;
-            });
+        .manage(state.clone())
+        .setup(move |_app| {
+            // clone Arc, now safe to send into 'static tasks
+            let state_clone = state.clone();
+
+
+            println!("[DEBUG] Starting VDrop app");
+            println!("[DEBUG] Device name: {}", device_name);
+            println!("[DEBUG] Instance ID: {}", instance_id);
+
+            let msg = DiscoveryMsg {
+                app: "vdrop".into(),
+                device_name,
+                port: PORT,
+                instance_id,
+            };
+
+
+            tauri::async_runtime::spawn(broadcast_presence(msg));
+            tauri::async_runtime::spawn(listen_for_devices(state_clone.clone()));
+            tauri::async_runtime::spawn(cleanup_devices(state_clone.clone()));
+            tauri::async_runtime::spawn(start_receiving());
+
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_network, send_file,get_received])
+
+        .invoke_handler(tauri::generate_handler![
+            scan_network,
+            send_file,
+            get_received
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
