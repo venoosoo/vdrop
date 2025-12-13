@@ -37,7 +37,7 @@ jobs:
         run: cargo install tauri-cli
         
       - name: Build Windows release
-        run: cargo tauri build --release
+        run: cargo tauri build
 
       # 6. Upload artifacts
       - name: Upload Windows App
