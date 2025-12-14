@@ -1,7 +1,3 @@
-That's a great idea for readability! Using a dedicated list format makes the "To-Do" section much clearer.
-
-Here is the revised README.md focusing on improved formatting for the Contributing & To-Do section:
-Markdown
 
 # 💧 vdrop
 
