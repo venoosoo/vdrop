@@ -1,3 +1,8 @@
+That's a great idea for readability! Using a dedicated list format makes the "To-Do" section much clearer.
+
+Here is the revised README.md focusing on improved formatting for the Contributing & To-Do section:
+Markdown
+
 # 💧 vdrop
 
 [![GitHub license](https://img.shields.io/github/license/venoosoo/vdrop)](LICENSE)
@@ -49,22 +54,25 @@ You will need the standard development environment for a Tauri application, incl
 
     (For production builds, use cargo tauri build)
 
-    View History: Use the history tab to see a record of all received files.
 
 Contributing & To-Do
 
-Contributions, issues, and feature requests are welcome!
-Planned Features / To-Do List
+We welcome contributions, bug reports, and suggestions! Please feel free to open an issue or submit a pull request.
+🔨 Development Roadmap (To-Do)
 
-A dedicated Settings Tab is planned to introduce user customization, including:
+A major focus is introducing a dedicated Settings Tab to give users control over the application's behavior and appearance:
 
-   -Language selection.
+    Customization:
 
-   -Option to automatically accept incoming files.
+        ✅ Implement support for Changing Themes (e.g., Light/Dark mode).
 
-   -Implementation of a white/black list for trusted devices.
+        ✅ Introduce Language Selection.
 
-   -Support for different UI themes (e.g., Light/Dark mode).
+    Security & Control:
+
+        ✅ Add an option for Automatically Accepting/Rejecting Files.
+
+        ✅ Develop a White/Black List feature for trusted/blocked devices.
 
 License
 
