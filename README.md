@@ -58,13 +58,13 @@ Planned Features / To-Do List
 
 A dedicated Settings Tab is planned to introduce user customization, including:
 
-    Language selection.
+   -Language selection.
 
-    Option to automatically accept incoming files.
+   -Option to automatically accept incoming files.
 
-    Implementation of a white/black list for trusted devices.
+   -Implementation of a white/black list for trusted devices.
 
-    Support for different UI themes (e.g., Light/Dark mode).
+   -Support for different UI themes (e.g., Light/Dark mode).
 
 License
 
