@@ -2,14 +2,11 @@ use tauri::State;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::fs::File;
-use tokio::time::{timeout, Duration};
-use tokio::task;
+use tokio::time::{Duration};
 use tokio::sync::Mutex;
-use tokio::process::Command;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr};
 use serde::Serialize;
 use hostname::get;
-use futures::StreamExt;
 use local_ip_address::local_ip;
 use std::fs;
 use base64::{Engine};
@@ -24,7 +21,6 @@ use std::time::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::Manager;
-
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DiscoveryMsg {
@@ -57,7 +53,7 @@ async fn send_file(ip: String, file_path: String, file_name: String) -> Result<S
     let full_address = format!("{}:{}", ip, PORT);
     println!("Connecting to {}...", full_address);
 
-    let mut stream = TcpStream::connect(&full_address)
+    let mut stream = TcpStream::connect(&full_address) 
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", ip, e))?;
 
@@ -89,43 +85,114 @@ async fn send_file(ip: String, file_path: String, file_name: String) -> Result<S
 
 
 async fn broadcast_presence(msg: DiscoveryMsg) {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    socket.set_broadcast(true).unwrap();
-    let data = serde_json::to_vec(&msg).unwrap();
+    // bind ephemeral port for sending
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[DEBUG][BROADCAST] bind error: {}", e);
+            return;
+        }
+    };
 
-    println!("[DEBUG][BROADCAST] Sending presence every 3s");
+    // allow sending broadcast
+    if let Err(e) = socket.set_broadcast(true) {
+        println!("[DEBUG][BROADCAST] set_broadcast failed: {}", e);
+    }
+
+    let data = match serde_json::to_vec(&msg) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[DEBUG][BROADCAST] serde error: {}", e);
+            return;
+        }
+    };
+    let broadcast_addr = if let Ok(local) = local_ip() {
+        match local {
+            IpAddr::V4(v4) => format!("{}.{}.{}.255:{}", v4.octets()[0], v4.octets()[1], v4.octets()[2], msg.port),
+            IpAddr::V6(_) => format!("255.255.255.255:{}", msg.port), // fallback
+        }
+    } else {
+        format!("255.255.255.255:{}", msg.port)
+    };
+
+    println!("[DEBUG][BROADCAST] sending to {}", broadcast_addr);
 
     loop {
-        if let Err(e) = socket.send_to(&data, "255.255.255.255:5005").await {
-            println!("[DEBUG][BROADCAST] Failed to send: {}", e);
+        match socket.send_to(&data, &broadcast_addr).await {
+            Ok(n) => println!("[DEBUG][BROADCAST] sent {} bytes to {}", n, broadcast_addr),
+            Err(e) => println!("[DEBUG][BROADCAST] send_to error: {}", e),
         }
-
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
 
 async fn listen_for_devices(state: Arc<AppState>) {
-    let socket = UdpSocket::bind("0.0.0.0:5005").await.unwrap();
-    let mut buf = [0u8; 1024];
-    println!("[DEBUG][LISTENER] UDP listener started on 0.0.0.0:5005");
+    // bind listener
+    let socket = match UdpSocket::bind(("0.0.0.0", PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[DEBUG][LISTENER] bind error: {}", e);
+            return;
+        }
+    };
+
+    // enabling broadcast on recv side is safe/harmless
+    if let Err(e) = socket.set_broadcast(true) {
+        println!("[DEBUG][LISTENER] set_broadcast failed: {}", e);
+    }
+
+    let mut buf = [0u8; 2048];
+    println!("[DEBUG][LISTENER] UDP listener started on 0.0.0.0:{}", PORT);
 
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
-                if let Ok(msg) = serde_json::from_slice::<DiscoveryMsg>(&buf[..len]) {
-                    if msg.app == "vdrop" && msg.instance_id != state.instance_id {
-                        let mut devices = state.devices.lock().await;
-                        devices.insert(
-                            addr.ip(),
-                            (Pc { ip: addr.ip(), name: msg.device_name.clone() }, std::time::Instant::now())
+                let raw = &buf[..len];
+                let as_text = String::from_utf8_lossy(raw);
+                println!(
+                    "[DEBUG][LISTENER] recv {} bytes from {}: {}",
+                    len, addr, as_text
+                );
+
+                match serde_json::from_slice::<DiscoveryMsg>(raw) {
+                    Ok(msg) => {
+                        // sanity checks
+                        if msg.app == "vdrop" && msg.instance_id != state.instance_id {
+                            let mut devices = state.devices.lock().await;
+                            devices.insert(
+                                addr.ip(),
+                                (
+                                    Pc {
+                                        ip: addr.ip(),
+                                        name: msg.device_name.clone(),
+                                    },
+                                    std::time::Instant::now(),
+                                ),
+                            );
+                            println!(
+                                "[DEBUG][LISTENER] Found device: {} ({})",
+                                msg.device_name, addr.ip()
+                            );
+                        } else {
+                            println!(
+                                "[DEBUG][LISTENER] Ignored message (app={} id_equal={})",
+                                msg.app,
+                                msg.instance_id == state.instance_id
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "[DEBUG][LISTENER] JSON parse error from {}: {}, raw={:?}",
+                            addr, e, as_text
                         );
-                        println!("[DEBUG][LISTENER] Found device: {} ({})", msg.device_name, addr.ip());
                     }
                 }
             }
             Err(e) => {
                 println!("[DEBUG][LISTENER] UDP recv error: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -133,10 +200,11 @@ async fn listen_for_devices(state: Arc<AppState>) {
 
 // --- SCAN NETWORK COMMAND ---
 #[tauri::command]
-async fn scan_network(state: State<'_, AppState>) -> Result<Vec<Pc>, String> {
+async fn scan_network(state: State<'_, Arc<AppState>>) -> Result<Vec<Pc>, String> {
     let devices = state.devices.lock().await;
     Ok(devices.values().map(|(pc, _)| pc.clone()).collect())
 }
+
 
 
 
@@ -304,39 +372,29 @@ pub fn run() {
         .to_string_lossy()
         .to_string();
 
-    let state = Arc::new(AppState {
-        devices: Mutex::new(HashMap::new()),
-        instance_id: instance_id.clone(),
-    });
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(state.clone())
-        .setup(move |_app| {
-            // clone Arc, now safe to send into 'static tasks
-            let state_clone = state.clone();
-
-
-            println!("[DEBUG] Starting VDrop app");
-            println!("[DEBUG] Device name: {}", device_name);
-            println!("[DEBUG] Instance ID: {}", instance_id);
+        .manage(Arc::new(AppState {
+            devices: Mutex::new(HashMap::new()),
+            instance_id: instance_id.clone(),
+        }))
+        .setup(|app| {
+            let state: Arc<AppState> = app.state::<Arc<AppState>>().inner().clone();
 
             let msg = DiscoveryMsg {
                 app: "vdrop".into(),
                 device_name,
                 port: PORT,
-                instance_id,
+                instance_id: state.instance_id.clone(),
             };
 
-
             tauri::async_runtime::spawn(broadcast_presence(msg));
-            tauri::async_runtime::spawn(listen_for_devices(state_clone.clone()));
-            tauri::async_runtime::spawn(cleanup_devices(state_clone.clone()));
+            tauri::async_runtime::spawn(listen_for_devices(state.clone()));
+            tauri::async_runtime::spawn(cleanup_devices(state.clone()));
             tauri::async_runtime::spawn(start_receiving());
 
             Ok(())
         })
-
         .invoke_handler(tauri::generate_handler![
             scan_network,
             send_file,
@@ -345,3 +403,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
